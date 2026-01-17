@@ -18,11 +18,18 @@ app.post("/check", async (req, res) => {
     return res.status(400).json({ error: "Missing fields" });
   }
 
-  await pool.query(
-    `INSERT INTO reservations (identifier, platform_id, start_time, end_time, status)
-     VALUES ($1, $2, $3, $3 + interval '2 hours', 'ACTIVE')`,
-    [identifier, platform_id, start_time]
-  );
+ await pool.query(
+  `INSERT INTO reservations (
+    reservationidentifier,
+    reservationplatformid,
+    reservationstarttime,
+    reservationendtime,
+    reservationstatus
+  )
+   VALUES ($1, $2, $3, $3 + interval '2 hours', 'ACTIVE')`,
+  [identifier, platform_id, start_time]
+);
+
 
   res.json({ status: "OK", basis: global_key ? "GLOBAL_KEY" : "LOCAL_KEY" });
 });
