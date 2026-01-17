@@ -20,7 +20,7 @@ app.post("/check", async (req, res) => {
     }
 
     await pool.query(
-      `INSERT INTO Reservations (
+      `INSERT INTO "Reservations" (
         reservationidentifier,
         reservationplatformid,
         reservationstarttime,
