@@ -75,7 +75,7 @@ app.post("/check", async (req, res) => {
       basis: global_key ? "GLOBAL_KEY" : "LOCAL_KEY"
     });
 
-  } catch (err) {
+    catch (err) {
     // 🚨 FAIL-OPEN: ALDRIG BLOKER
     console.error("FAIL-OPEN:", err.message);
 
