@@ -5,122 +5,108 @@ const { Pool } = pkg;
 const app = express();
 app.use(express.json());
 
-// --------------------
-// Database connection
-// --------------------
+// ==========================
+// Database
+// ==========================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL
     ? { rejectUnauthorized: false }
-    : false
+    : false,
 });
 
-// --------------------
+// ==========================
 // Health check
-// --------------------
-app.get("/", (req, res) => {
-  res.json({ status: "OK", service: "ClearSlot" });
+// ==========================
+app.get("/", (_, res) => {
+  res.json({ status: "ClearSlot alive" });
 });
 
-// --------------------
-// CHECK endpoint
-// --------------------
+// ==========================
+// CHECK ENDPOINT (FAIL-OPEN)
+// ==========================
 app.post("/check", async (req, res) => {
-  const { platform_id, global_key, guest_key, start_time } = req.body;
-
-  // Fail-open ved manglende data
-  if (!platform_id || !start_time || (!global_key && !guest_key)) {
-    return res.json({
-      status: "OK",
-      basis: "FAIL_OPEN_MISSING_FIELDS"
-    });
-  }
+  const { platform_id, global_key, guest_key, start_time, end_time } = req.body;
 
   const identifier = global_key || guest_key;
 
+  // Minimal validering
+  if (!platform_id || !identifier || !start_time) {
+    return res.status(400).json({ error: "Missing fields" });
+  }
+
+  // Fallback: hvis ingen end_time → +2 timer
+  const start = new Date(start_time);
+  const end = end_time
+    ? new Date(end_time)
+    : new Date(start.getTime() + 2 * 60 * 60 * 1000);
+
   try {
-    // --------------------
-    // Overlap check
-    // --------------------
+    // ==========================
+    // OVERLAP CHECK
+    // ==========================
     const overlapQuery = `
-      SELECT reservationid
+      SELECT 1
       FROM "Reservations"
       WHERE reservationidentifier = $1
         AND reservationstatus = 'ACTIVE'
-        AND tstzrange(
-              reservationstarttime,
-              reservationendtime,
-              '[)'
-            ) && tstzrange(
-              $2::timestamptz,
-              $2::timestamptz + interval '2 hours',
-              '[)'
-            )
+        AND tstzrange(reservationstarttime, reservationendtime)
+            && tstzrange($2, $3)
       LIMIT 1
     `;
 
     const overlapResult = await pool.query(overlapQuery, [
       identifier,
-      start_time
+      start,
+      end,
     ]);
 
-    if (overlapResult.rowCount > 0) {
-      // Overlap fundet → stadig fail-open (platform beslutter selv)
-      return res.json({
-        status: "OK",
-        basis: "OVERLAP_DETECTED"
-      });
-    }
+    const overlapDetected = overlapResult.rowCount > 0;
 
-    // --------------------
-    // Insert reservation
-    // --------------------
+    // ==========================
+    // INSERT RESERVATION
+    // ==========================
     const insertQuery = `
       INSERT INTO "Reservations" (
         reservationidentifier,
         reservationplatformid,
         reservationstarttime,
         reservationendtime,
-        reservationstatus,
-        reservationcreatedat
+        reservationstatus
       )
-      VALUES (
-        $1,
-        $2,
-        $3::timestamptz,
-        $3::timestamptz + interval '2 hours',
-        'ACTIVE',
-        NOW()
-      )
+      VALUES ($1, $2, $3, $4, 'ACTIVE')
     `;
 
     await pool.query(insertQuery, [
       identifier,
       platform_id,
-      start_time
+      start,
+      end,
     ]);
 
+    // ==========================
+    // RESPONSE
+    // ==========================
     return res.json({
       status: "OK",
-      basis: global_key ? "GLOBAL_KEY" : "LOCAL_KEY"
+      basis: overlapDetected ? "OVERLAP_DETECTED" : "NO_OVERLAP",
     });
-
   } catch (err) {
-    // --------------------
-    // FAIL-OPEN catch-all
-    // --------------------
-    console.error("ClearSlot error:", err);
+    // ==========================
+    // FAIL-OPEN
+    // ==========================
+    console.error("ClearSlot fail-open:", err.message);
 
     return res.json({
       status: "OK",
-      basis: "FAIL_OPEN_EXCEPTION"
+      basis: "FAIL_OPEN",
     });
   }
 });
 
-// --------------------
+// ==========================
 // Start server
-// --------------------
+// ==========================
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log("ClearSlot running on port", port);
