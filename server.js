@@ -10,10 +10,24 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// ===== CONFIG =====
 const DECAY_DAYS = 30;
 const DECAY_AMOUNT = 1;
 
-// Ensure behavior key exists
+const THRESHOLDS = {
+  GREEN: 0,
+  YELLOW: 3,
+  RED: 6
+};
+
+// ===== HELPERS =====
+
+function getRiskLevel(score) {
+  if (score >= THRESHOLDS.RED) return "RED";
+  if (score >= THRESHOLDS.YELLOW) return "YELLOW";
+  return "GREEN";
+}
+
 async function ensureBehaviorKey(key) {
   await pool.query(
     `INSERT INTO behavior_scores (behavior_key, score)
@@ -23,7 +37,6 @@ async function ensureBehaviorKey(key) {
   );
 }
 
-// Apply decay if time passed
 async function applyDecay(key) {
   const res = await pool.query(
     `SELECT score, last_updated FROM behavior_scores WHERE behavior_key = $1`,
@@ -50,7 +63,6 @@ async function applyDecay(key) {
   );
 }
 
-// Increment score
 async function addScore(key, amount) {
   await pool.query(
     `UPDATE behavior_scores
@@ -61,6 +73,16 @@ async function addScore(key, amount) {
   );
 }
 
+async function getScore(key) {
+  const res = await pool.query(
+    `SELECT score FROM behavior_scores WHERE behavior_key = $1`,
+    [key]
+  );
+  return res.rowCount ? res.rows[0].score : 0;
+}
+
+// ===== ENDPOINT =====
+
 app.post("/check", async (req, res) => {
   const { platform_id, global_key, guest_key, start_time, end_time } = req.body;
   const identifier = global_key || guest_key;
@@ -70,13 +92,11 @@ app.post("/check", async (req, res) => {
   }
 
   try {
-    // 1. Ensure behavior row exists
+    // 1. Prepare behavior tracking
     await ensureBehaviorKey(identifier);
-
-    // 2. Apply decay before evaluation
     await applyDecay(identifier);
 
-    // 3. Overlap check
+    // 2. Check overlap
     const overlap = await pool.query(
       `SELECT 1 FROM "Reservations"
        WHERE reservationidentifier = $1
@@ -106,9 +126,13 @@ app.post("/check", async (req, res) => {
       );
     }
 
+    const score = await getScore(identifier);
+    const risk_level = getRiskLevel(score);
+
     res.json({
       status: "OK",
       signal,
+      risk_level,
       shadow_mode: true
     });
 
@@ -117,6 +141,7 @@ app.post("/check", async (req, res) => {
     res.json({
       status: "OK",
       signal: "UNKNOWN",
+      risk_level: "GREEN",
       fail_open: true
     });
   }
