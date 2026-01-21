@@ -1,68 +1,95 @@
-import pkg from "pg";
+import pkg from 'pg';
+import dotenv from 'dotenv';
+
+dotenv.config({ path: './.env' });
+
 const { Pool } = pkg;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+  ssl: { rejectUnauthorized: false }
 });
 
-async function runCleanup() {
-  console.log("🧹 ClearSlot cron started");
+/* ============================
+   REGEN CONFIG
+============================ */
+
+const REGEN_RATES = {
+  mild: 2,
+  medium: 1,
+  high: 0.25
+};
+
+/* ============================
+   CRON JOB
+============================ */
+
+async function runCron() {
+  const client = await pool.connect();
 
   try {
-    const now = new Date();
+    console.log('CRON START');
 
-    // 1. Find udløbne aktive reservationer
-    const expired = await pool.query(
-      `
-      SELECT reservationidentifier
-      FROM reservations
-      WHERE reservationstatus = 'ACTIVE'
-        AND reservationendtime < $1
-      `,
-      [now]
-    );
+    /* 1. Delete expired events */
+    const expired = await client.query(`
+      DELETE FROM behavior_events
+      WHERE expires_at < NOW()
+      RETURNING customer_hash, platform_id, identity_scope, severity
+    `);
 
-    console.log(`Found ${expired.rowCount} expired reservations`);
+    console.log(`Expired events removed: ${expired.rowCount}`);
 
-    // 2. Opdater adfærd (hvis tabel findes)
-    for (const row of expired.rows) {
-      try {
-        await pool.query(
+    /* 2. Regenerate scores */
+    const regen = await client.query(`
+      SELECT
+        cs.customer_hash,
+        cs.platform_id,
+        cs.identity_scope,
+        cs.score,
+        MAX(be.severity) AS worst_severity
+      FROM customer_scores cs
+      LEFT JOIN behavior_events be
+        ON cs.customer_hash = be.customer_hash
+       AND cs.identity_scope = be.identity_scope
+       AND (cs.identity_scope = 'global' OR cs.platform_id = be.platform_id)
+      GROUP BY cs.customer_hash, cs.platform_id, cs.identity_scope, cs.score
+    `);
+
+    for (const row of regen.rows) {
+      const severity = row.worst_severity || 'mild';
+      const regenAmount = REGEN_RATES[severity] || 1;
+
+      const newScore = Math.min(100, row.score + regenAmount);
+
+      if (newScore !== row.score) {
+        await client.query(
           `
-          INSERT INTO behavior_scores (identifier, score, last_event_at)
-          VALUES ($1, 1, NOW())
-          ON CONFLICT (identifier)
-          DO UPDATE SET
-            score = behavior_scores.score + 1,
-            last_event_at = NOW()
+          UPDATE customer_scores
+          SET score = $1,
+              last_updated_at = NOW()
+          WHERE customer_hash = $2
+            AND platform_id = $3
+            AND identity_scope = $4
           `,
-          [row.reservationidentifier]
+          [
+            newScore,
+            row.customer_hash,
+            row.platform_id,
+            row.identity_scope
+          ]
         );
-      } catch (e) {
-        // Hvis behavior_scores ikke findes → ignorer
-        console.log("ℹ️ behavior_scores not available, skipping");
-        break;
       }
     }
 
-    // 3. Slet udløbne reservationer
-    await pool.query(
-      `
-      DELETE FROM reservations
-      WHERE reservationstatus = 'ACTIVE'
-        AND reservationendtime < $1
-      `,
-      [now]
-    );
+    console.log(`Scores regenerated: ${regen.rows.length}`);
 
-    console.log("✅ Cleanup completed safely");
+    console.log('CRON END');
   } catch (err) {
-    // FAIL-OPEN: vi logger, men gør intet farligt
-    console.error("❌ Cron error (fail-open):", err.message);
+    console.error('CRON ERROR:', err);
   } finally {
+    client.release();
     await pool.end();
   }
 }
 
-runCleanup();
+runCron();
