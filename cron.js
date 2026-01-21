@@ -17,7 +17,7 @@ const pool = new Pool({
 const REGEN_RATES = {
   mild: 2,
   medium: 1,
-  high: 0.25
+  high: 0
 };
 
 /* ============================
