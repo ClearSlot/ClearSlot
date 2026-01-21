@@ -1,157 +1,246 @@
-import express from "express";
-import pkg from "pg";
+import express from 'express';
+import pkg from 'pg';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const { Pool } = pkg;
+
 const app = express();
 app.use(express.json());
+
+/* GLOBAL ERROR LOGGING */
+
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION:', reason);
+});
+
+
+
+/* ============================
+   DATABASE
+============================ */
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// ===== CONFIG =====
-const DECAY_DAYS = 30;
-const DECAY_AMOUNT = 1;
+/* ============================
+   SCORE-REGLER
+============================ */
 
-const THRESHOLDS = {
-  GREEN: 0,
-  YELLOW: 3,
-  RED: 6
+const SCORE_RULES = {
+  overlap:        { delta: -10, severity: 'mild',   ttlDays: 14 },
+  repeat_overlap: { delta: -20, severity: 'medium', ttlDays: 90 },
+  no_show:        { delta: -30, severity: 'high',   ttlDays: 365 }
 };
 
-// ===== HELPERS =====
+/* ============================
+   FUNKTIONER
+============================ */
 
-function getRiskLevel(score) {
-  if (score >= THRESHOLDS.RED) return "RED";
-  if (score >= THRESHOLDS.YELLOW) return "YELLOW";
-  return "GREEN";
+async function getOrCreateScore(client, customer_hash, platform_id, identity_scope) {
+  const res = await client.query(
+    `
+    SELECT * FROM customer_scores
+    WHERE customer_hash = $1
+      AND identity_scope = $2
+      AND (identity_scope = 'global' OR platform_id = $3)
+    `,
+    [customer_hash, identity_scope, platform_id]
+  );
+
+  if (res.rows.length) return res.rows[0];
+
+  const insert = await client.query(
+    `
+    INSERT INTO customer_scores (customer_hash, platform_id, identity_scope)
+    VALUES ($1, $2, $3)
+    RETURNING *
+    `,
+    [customer_hash, platform_id, identity_scope]
+  );
+
+  return insert.rows[0];
 }
 
-async function ensureBehaviorKey(key) {
-  await pool.query(
-    `INSERT INTO behavior_scores (behavior_key, score)
-     VALUES ($1, 0)
-     ON CONFLICT (behavior_key) DO NOTHING`,
-    [key]
+async function hasRecentOverlap(client, customer_hash, platform_id, identity_scope) {
+  const res = await client.query(
+    `
+    SELECT 1 FROM behavior_events
+    WHERE customer_hash = $1
+      AND event_type IN ('overlap','repeat_overlap')
+      AND expires_at > NOW()
+      AND identity_scope = $2
+      AND (identity_scope = 'global' OR platform_id = $3)
+    LIMIT 1
+    `,
+    [customer_hash, identity_scope, platform_id]
+  );
+
+  return res.rowCount > 0;
+}
+
+async function applyBehaviorEvent(client, customer_hash, platform_id, identity_scope, type) {
+  const rule = SCORE_RULES[type];
+  const now = new Date();
+  const expires = new Date(now);
+  expires.setDate(expires.getDate() + rule.ttlDays);
+
+  await client.query(
+    `
+    INSERT INTO behavior_events
+    (id, customer_hash, platform_id, identity_scope,
+     event_type, severity, score_delta, occurred_at, expires_at)
+    VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8)
+    `,
+    [
+      customer_hash,
+      platform_id,
+      identity_scope,
+      type,
+      rule.severity,
+      rule.delta,
+      now,
+      expires
+    ]
+  );
+
+  await client.query(
+    `
+    UPDATE customer_scores
+    SET score = GREATEST(0, LEAST(100, score + $1)),
+        last_updated_at = NOW()
+    WHERE customer_hash = $2
+      AND identity_scope = $3
+      AND (identity_scope = 'global' OR platform_id = $4)
+    `,
+    [rule.delta, customer_hash, identity_scope, platform_id]
   );
 }
 
-async function applyDecay(key) {
-  const res = await pool.query(
-    `SELECT score, last_updated FROM behavior_scores WHERE behavior_key = $1`,
-    [key]
-  );
-
-  if (res.rowCount === 0) return;
-
-  const { score, last_updated } = res.rows[0];
-  const daysPassed =
-    (Date.now() - new Date(last_updated).getTime()) / (1000 * 60 * 60 * 24);
-
-  const decaySteps = Math.floor(daysPassed / DECAY_DAYS);
-  if (decaySteps <= 0) return;
-
-  const newScore = Math.max(0, score - decaySteps * DECAY_AMOUNT);
-
-  await pool.query(
-    `UPDATE behavior_scores
-     SET score = $2,
-         last_updated = NOW()
-     WHERE behavior_key = $1`,
-    [key, newScore]
-  );
-}
-
-async function addScore(key, amount) {
-  await pool.query(
-    `UPDATE behavior_scores
-     SET score = score + $2,
-         last_updated = NOW()
-     WHERE behavior_key = $1`,
-    [key, amount]
-  );
-}
-
-async function getScore(key) {
-  const res = await pool.query(
-    `SELECT score FROM behavior_scores WHERE behavior_key = $1`,
-    [key]
-  );
-  return res.rowCount ? res.rows[0].score : 0;
-}
-
-// ===== ENDPOINT =====
+/* ============================
+   ENDPOINTS
+============================ */
 
 app.get('/ping', (req, res) => {
   res.json({ pong: true });
 });
 
-app.post("/check", async (req, res) => {
-  const { platform_id, global_key, guest_key, start_time, end_time } = req.body;
-  const identifier = global_key || guest_key;
+app.post('/event/overlap', async (req, res) => {
+  console.log('OVERLAP HIT', req.body);
 
-  if (!identifier || !platform_id || !start_time || !end_time) {
-    return res.status(400).json({ error: "Missing fields" });
-  }
+  const { customer_hash, platform_id, identity_scope = 'local' } = req.body;
+
+  const client = await pool.connect();
+  console.log('DB CONNECTED');
 
   try {
-    // 1. Prepare behavior tracking
-    await ensureBehaviorKey(identifier);
-    await applyDecay(identifier);
+    await client.query('BEGIN');
+    console.log('TX BEGIN');
 
-    // 2. Check overlap
-    const overlap = await pool.query(
-      `SELECT 1 FROM "Reservations"
-       WHERE reservationidentifier = $1
-         AND reservationstatus = 'ACTIVE'
-         AND tstzrange(reservationstarttime, reservationendtime)
-             && tstzrange($2::timestamptz, $3::timestamptz)
-       LIMIT 1`,
-      [identifier, start_time, end_time]
+    await getOrCreateScore(client, customer_hash, platform_id, identity_scope);
+    console.log('SCORE OK');
+
+    const repeat = await hasRecentOverlap(
+      client,
+      customer_hash,
+      platform_id,
+      identity_scope
     );
+    console.log('REPEAT CHECK:', repeat);
 
-    let signal = "OK";
+    const type = repeat ? 'repeat_overlap' : 'overlap';
 
-    if (overlap.rowCount > 0) {
-      await addScore(identifier, 3);
-      signal = "OVERLAP";
-    } else {
-      await pool.query(
-        `INSERT INTO "Reservations" (
-          reservationidentifier,
-          reservationplatformid,
-          reservationstarttime,
-          reservationendtime,
-          reservationstatus
-        )
-        VALUES ($1, $2, $3, $4, 'ACTIVE')`,
-        [identifier, platform_id, start_time, end_time]
-      );
-    }
+    await applyBehaviorEvent(
+      client,
+      customer_hash,
+      platform_id,
+      identity_scope,
+      type
+    );
+    console.log('EVENT APPLIED');
 
-    const score = await getScore(identifier);
-    const risk_level = getRiskLevel(score);
+    await client.query('COMMIT');
+    console.log('TX COMMIT');
 
-    res.json({
-      status: "OK",
-      signal,
-      risk_level,
-      shadow_mode: true
-    });
-
+    res.json({ ok: true, event: type });
   } catch (err) {
-    console.error("FAIL-OPEN ERROR:", err.message);
-    res.json({
-      status: "OK",
-      signal: "UNKNOWN",
-      risk_level: "GREEN",
-      fail_open: true
-    });
+    console.error('OVERLAP ERROR:', err);
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+    console.log('DB RELEASED');
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log("ClearSlot running on port", port);
+
+app.post('/event/no-show', async (req, res) => {
+  const { customer_hash, platform_id, identity_scope = 'local' } = req.body;
+  if (!customer_hash || !platform_id) {
+    return res.status(400).json({ error: 'customer_hash and platform_id required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await getOrCreateScore(client, customer_hash, platform_id, identity_scope);
+    await applyBehaviorEvent(client, customer_hash, platform_id, identity_scope, 'no_show');
+
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/score/:customer_hash', async (req, res) => {
+  const { customer_hash } = req.params;
+  const { platform_id, identity_scope = 'local' } = req.query;
+
+  if (!platform_id) {
+    return res.status(400).json({ error: 'platform_id required' });
+  }
+
+  const result = await pool.query(
+    `
+    SELECT score FROM customer_scores
+    WHERE customer_hash = $1
+      AND identity_scope = $2
+      AND (identity_scope = 'global' OR platform_id = $3)
+    `,
+    [customer_hash, identity_scope, platform_id]
+  );
+
+  if (!result.rows.length) {
+    return res.status(404).json({ error: 'not found' });
+  }
+
+  const score = result.rows[0].score;
+
+  const recommendation =
+    score < 40 ? 'Deposit recommended' :
+    score < 70 ? 'Confirmation recommended' :
+                 'No action';
+
+  res.json({ score, recommendation });
+});
+
+/* ============================
+   START SERVER
+============================ */
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`ClearSlot API running on port ${PORT}`);
 });
