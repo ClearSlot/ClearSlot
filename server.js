@@ -83,6 +83,10 @@ async function getScore(key) {
 
 // ===== ENDPOINT =====
 
+app.get('/ping', (req, res) => {
+  res.json({ pong: true });
+});
+
 app.post("/check", async (req, res) => {
   const { platform_id, global_key, guest_key, start_time, end_time } = req.body;
   const identifier = global_key || guest_key;
