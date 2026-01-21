@@ -46,7 +46,11 @@ async function runCron() {
         cs.platform_id,
         cs.identity_scope,
         cs.score,
-        MAX(be.severity) AS worst_severity
+        MAX(CASE be.severity
+          WHEN 'high' THEN 3
+          WHEN 'medium' THEN 2
+          WHEN 'mild' THEN 1
+          ELSE 0 END) AS worst_severity_level
       FROM customer_scores cs
       LEFT JOIN behavior_events be
         ON cs.customer_hash = be.customer_hash
@@ -56,7 +60,10 @@ async function runCron() {
     `);
 
     for (const row of regen.rows) {
-      const severity = row.worst_severity || 'mild';
+      const severity =
+        row.worst_severity_level === 3 ? 'high' :
+        row.worst_severity_level === 2 ? 'medium' :
+        'mild';
       const regenAmount = REGEN_RATES[severity] || 1;
 
       const newScore = Math.min(100, row.score + regenAmount);
