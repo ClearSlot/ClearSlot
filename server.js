@@ -9,6 +9,89 @@ const { Pool } = pkg;
 const app = express();
 app.use(express.json());
 
+/* ============================
+   DATABASE
+============================ */
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+/* ============================================================
+   NYT MODUL: LOGGING & DASHBOARD SUPPORT (Start)
+   Dette er det eneste nye logic, der er tilføjet.
+============================================================ */
+
+// 1. Middleware der logger alt aktivitet til 'api_logs' tabellen
+app.use(async (req, res, next) => {
+  const start = Date.now();
+
+  // Vi lytter på, hvornår svaret er sendt færdigt
+  res.on('finish', async () => {
+    const duration = Date.now() - start;
+    
+    // Vi logger ikke selve healthcheck-kaldene (ville spamme loggen)
+    if (req.path === '/healthcheck') return;
+
+    // Prøv at finde platform_id. Hvis det ikke er sendt med, sættes det til null/anonymous
+    const platformId = req.body?.platform_id || req.query?.platform_id || null;
+
+    try {
+      // Vi indsætter loggen uden at 'await', så vi ikke sløver svaret til kunden
+      // BEMÆRK: Kræver at tabellen 'api_logs' er oprettet i din DB
+      pool.query(
+        `INSERT INTO api_logs 
+        (platform_id, method, endpoint, status_code, duration_ms, request_body) 
+        VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          platformId, 
+          req.method, 
+          req.originalUrl, 
+          res.statusCode, 
+          duration,
+          JSON.stringify(req.body) 
+        ]
+      ).catch(err => console.error('LOGGING ERROR:', err));
+      
+    } catch (e) {
+      console.error('Log logic failed', e);
+    }
+  });
+
+  next();
+});
+
+// 2. Healthcheck Endpoint (Til grøn lampe på dashboard)
+app.get('/healthcheck', async (req, res) => {
+  try {
+    await pool.query('SELECT 1'); // Simpelt DB tjek
+    res.status(200).json({ status: 'healthy', database: 'connected', uptime: process.uptime() });
+  } catch (error) {
+    res.status(503).json({ status: 'unhealthy', error: error.message });
+  }
+});
+
+// 3. Hent Logs Endpoint (Så dashboardet kan vise listen)
+app.get('/api/logs/:platform_id', async (req, res) => {
+    const { platform_id } = req.params;
+    try {
+        const result = await pool.query(
+            `SELECT * FROM api_logs WHERE platform_id = $1 ORDER BY created_at DESC LIMIT 50`,
+            [platform_id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/* ============================================================
+   NYT MODUL: LOGGING & DASHBOARD SUPPORT (Slut)
+   Herunder er din originale kode uændret.
+============================================================ */
+
+
 /* GLOBAL ERROR LOGGING */
 
 process.on('uncaughtException', (err) => {
@@ -17,17 +100,6 @@ process.on('uncaughtException', (err) => {
 
 process.on('unhandledRejection', (reason) => {
   console.error('UNHANDLED REJECTION:', reason);
-});
-
-
-
-/* ============================
-   DATABASE
-============================ */
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
 });
 
 /* ============================
