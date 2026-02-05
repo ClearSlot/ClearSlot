@@ -1,12 +1,14 @@
 import express from 'express';
 import pkg from 'pg';
 import dotenv from 'dotenv';
+import cors from 'cors';
 
 dotenv.config();
 
 const { Pool } = pkg;
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 /* ============================
