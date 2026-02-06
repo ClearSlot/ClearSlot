@@ -2,7 +2,7 @@ import express from 'express';
 import pkg from 'pg';
 import dotenv from 'dotenv';
 import cors from 'cors';
-import crypto from 'crypto'; // <--- NY: Bruges til sikkerhed
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -16,27 +16,25 @@ app.use(express.json());
    SIKKERHED (PEPPERING) 🌶️
 ============================ */
 function secureHash(input) {
-  // Hvis input er tomt eller undefined, returner null
   if (!input) return null;
   
   const pepper = process.env.HASH_PEPPER;
+  // Fallback hvis pepper mangler (så crasher vi ikke, men logger en advarsel)
   if (!pepper) {
-    console.warn("ADVARSEL: HASH_PEPPER mangler i environment variables! Data gemmes uden ekstra sikkerhed.");
+    console.warn("ADVARSEL: HASH_PEPPER mangler! Data gemmes uden ekstra sikkerhed.");
     return input; 
   }
   
-  // Vi tager det hash partneren sendte + vores hemmelige pepper
   return crypto.createHash('sha256').update(input + pepper).digest('hex');
 }
 
 /* ============================
    DATABASE
 ============================ */
-// Vi tjekker om DATABASE_URL virker, ellers bruger vi vores manuelle backup
 const connectionString = process.env.DATABASE_URL || process.env.MANUAL_DB_URL;
 
 if (!connectionString) {
-  console.error("KRITISK FEJL: Ingen database-forbindelse fundet! Tjek MANUAL_DB_URL.");
+  console.error("KRITISK FEJL: Ingen database-forbindelse fundet! Tjek variablerne.");
 }
 
 const pool = new Pool({
@@ -47,7 +45,6 @@ const pool = new Pool({
 /* ============================
    LOVABLE WEBHOOK INTEGRATION
 ============================ */
-
 async function sendToLovable(type, payload) {
   if (!process.env.LOVABLE_WEBHOOK_URL) return;
 
@@ -58,10 +55,7 @@ async function sendToLovable(type, payload) {
         'Content-Type': 'application/json',
         'x-api-key': process.env.LOVABLE_API_KEY || 'system-update'
       },
-      body: JSON.stringify({
-        type: type,
-        data: payload
-      })
+      body: JSON.stringify({ type, data: payload })
     });
   } catch (err) {
     console.error('Kunne ikke sende til Lovable:', err.message);
@@ -69,12 +63,10 @@ async function sendToLovable(type, payload) {
 }
 
 /* ============================
-   MIDDLEWARE: LOGGING & DASHBOARD
+   MIDDLEWARE: LOGGING
 ============================ */
-
 app.use(async (req, res, next) => {
   const start = Date.now();
-
   res.on('finish', async () => {
     const duration = Date.now() - start;
     if (req.path === '/healthcheck') return;
@@ -86,15 +78,8 @@ app.use(async (req, res, next) => {
         `INSERT INTO api_logs 
         (platform_id, method, endpoint, status_code, duration_ms, request_body) 
         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [
-          platformId, 
-          req.method, 
-          req.originalUrl, 
-          res.statusCode, 
-          duration,
-          JSON.stringify(req.body) 
-        ]
-      ).catch(err => console.error('LOGGING ERROR:', err));
+        [platformId, req.method, req.originalUrl, res.statusCode, duration, JSON.stringify(req.body)]
+      ).catch(e => console.error('LOG ERROR:', e.message));
     } catch (e) { console.error(e); }
 
     sendToLovable('api_usage', {
@@ -103,17 +88,9 @@ app.use(async (req, res, next) => {
       request_count: 1,
       status: res.statusCode
     });
-
   });
-
   next();
 });
-
-/* ============================
-   STANDARD FEJL-HÅNDTERING
-============================ */
-process.on('uncaughtException', (err) => console.error('UNCAUGHT:', err));
-process.on('unhandledRejection', (reason) => console.error('UNHANDLED:', reason));
 
 /* ============================
    SCORE LOGIK
@@ -124,12 +101,14 @@ const SCORE_RULES = {
   no_show:        { delta: -30, severity: 'high',   ttlDays: 365 }
 };
 
+// Modtager nu identity_scope (finalScope)
 async function getOrCreateScore(client, secure_customer_hash, platform_id, identity_scope) {
   const res = await client.query(
     `SELECT * FROM customer_scores WHERE customer_hash = $1 AND identity_scope = $2 AND (identity_scope = 'global' OR platform_id = $3)`,
     [secure_customer_hash, identity_scope, platform_id]
   );
   if (res.rows.length) return res.rows[0];
+  
   const insert = await client.query(
     `INSERT INTO customer_scores (customer_hash, platform_id, identity_scope) VALUES ($1, $2, $3) RETURNING *`,
     [secure_customer_hash, platform_id, identity_scope]
@@ -151,10 +130,12 @@ async function applyBehaviorEvent(client, secure_customer_hash, platform_id, ide
   const expires = new Date(now);
   expires.setDate(expires.getDate() + rule.ttlDays);
 
+  // Indsætter med det korrekte scope og restaurant hash
   await client.query(
     `INSERT INTO behavior_events (id, customer_hash, platform_id, identity_scope, event_type, severity, score_delta, occurred_at, expires_at, restaurant_hash) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
     [secure_customer_hash, platform_id, identity_scope, type, rule.severity, rule.delta, now, expires, secure_restaurant_hash]
   );
+  
   await client.query(
     `UPDATE customer_scores SET score = GREATEST(0, LEAST(100, score + $1)), last_updated_at = NOW() WHERE customer_hash = $2 AND identity_scope = $3 AND (identity_scope = 'global' OR platform_id = $4)`,
     [rule.delta, secure_customer_hash, identity_scope, platform_id]
@@ -186,31 +167,39 @@ app.get('/ping', (req, res) => res.json({ pong: true }));
 
 // --- OVERLAP EVENT ---
 app.post('/event/overlap', async (req, res) => {
-  const { customer_hash, platform_id, identity_scope = 'local', restaurant_hash } = req.body;
+  // 1. Hent identity_scope fra request
+  const { customer_hash, platform_id, restaurant_hash, identity_scope } = req.body;
   
-  // 1. SIKKERHED: Vi hasher dataen med vores pepper før databasen ser den
+  // 2. Bestem scope (default: local)
+  const finalScope = identity_scope || 'local';
+
+  // 3. Sikkerhed (Hashing)
   const secure_cust = secureHash(customer_hash);
   const secure_rest = secureHash(restaurant_hash);
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await getOrCreateScore(client, secure_cust, platform_id, identity_scope);
-    const repeat = await hasRecentOverlap(client, secure_cust, platform_id, identity_scope);
+    
+    // Brug finalScope i alle kald
+    await getOrCreateScore(client, secure_cust, platform_id, finalScope);
+    const repeat = await hasRecentOverlap(client, secure_cust, platform_id, finalScope);
+    
     const type = repeat ? 'repeat_overlap' : 'overlap';
     
-    await applyBehaviorEvent(client, secure_cust, platform_id, identity_scope, type, secure_rest);
+    await applyBehaviorEvent(client, secure_cust, platform_id, finalScope, type, secure_rest);
     
     await client.query('COMMIT');
     
     sendToLovable('event', {
-      platform_id: platform_id, 
+      platform_id, 
       event_type: type,
-      customer_hash: customer_hash, // Vi sender den originale hash til Lovable (UI), ikke den hemmelige
-      restaurant_hash: restaurant_hash 
+      customer_hash, // Sender original ID til Dashboard (UI)
+      restaurant_hash,
+      scope: finalScope // Sender scope info til dashboard
     });
 
-    res.json({ ok: true, event: type });
+    res.json({ ok: true, event: type, scope: finalScope });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
@@ -221,29 +210,33 @@ app.post('/event/overlap', async (req, res) => {
 
 // --- NO-SHOW EVENT ---
 app.post('/event/no-show', async (req, res) => {
-  const { customer_hash, platform_id, identity_scope = 'local', restaurant_hash } = req.body;
+  const { customer_hash, platform_id, restaurant_hash, identity_scope } = req.body;
 
-  // 1. SIKKERHED: Pepper på
+  // Bestem scope
+  const finalScope = identity_scope || 'local';
+
+  // Sikkerhed
   const secure_cust = secureHash(customer_hash);
   const secure_rest = secureHash(restaurant_hash);
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await getOrCreateScore(client, secure_cust, platform_id, identity_scope);
+    await getOrCreateScore(client, secure_cust, platform_id, finalScope);
     
-    await applyBehaviorEvent(client, secure_cust, platform_id, identity_scope, 'no_show', secure_rest);
+    await applyBehaviorEvent(client, secure_cust, platform_id, finalScope, 'no_show', secure_rest);
     
     await client.query('COMMIT');
 
     sendToLovable('event', {
-      platform_id: platform_id,
+      platform_id,
       event_type: 'no_show',
-      customer_hash: customer_hash,
-      restaurant_hash: restaurant_hash 
+      customer_hash,
+      restaurant_hash,
+      scope: finalScope
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, scope: finalScope });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
@@ -255,19 +248,27 @@ app.post('/event/no-show', async (req, res) => {
 // --- GET SCORE ---
 app.get('/score/:customer_hash', async (req, res) => {
   const { customer_hash } = req.params;
-  const { platform_id, identity_scope = 'local' } = req.query;
+  // Hent scope fra URL parametre (req.query)
+  const { platform_id, identity_scope } = req.query;
 
-  // 1. SIKKERHED: Vi skal huske at peppe inputtet for at finde det i databasen
+  const finalScope = identity_scope || 'local';
+
+  // Husk at hashe inputtet for at finde det i DB
   const secure_cust = secureHash(customer_hash);
 
-  const result = await pool.query(
-    `SELECT score FROM customer_scores WHERE customer_hash = $1 AND identity_scope = $2 AND (identity_scope = 'global' OR platform_id = $3)`,
-    [secure_cust, identity_scope, platform_id]
-  );
-  if (!result.rows.length) return res.status(404).json({ error: 'not found' });
-   
-  const score = result.rows[0].score;
-  res.json({ score });
+  try {
+    const result = await pool.query(
+      `SELECT score FROM customer_scores WHERE customer_hash = $1 AND identity_scope = $2 AND (identity_scope = 'global' OR platform_id = $3)`,
+      [secure_cust, finalScope, platform_id]
+    );
+
+    if (!result.rows.length) return res.status(404).json({ error: 'not found' });
+    
+    const score = result.rows[0].score;
+    res.json({ score, scope: finalScope });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 /* ============================
