@@ -32,9 +32,15 @@ function secureHash(input) {
 /* ============================
    DATABASE
 ============================ */
+// Vi tjekker om DATABASE_URL virker, ellers bruger vi vores manuelle backup
+const connectionString = process.env.DATABASE_URL || process.env.MANUAL_DB_URL;
+
+if (!connectionString) {
+  console.error("KRITISK FEJL: Ingen database-forbindelse fundet! Tjek MANUAL_DB_URL.");
+}
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: connectionString,
   ssl: { rejectUnauthorized: false }
 });
 
