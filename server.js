@@ -7,7 +7,6 @@ import crypto from 'crypto';
 dotenv.config();
 
 const { Pool } = pkg;
-
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -17,264 +16,168 @@ app.use(express.json());
 ============================ */
 function secureHash(input) {
   if (!input) return null;
-  
   const pepper = process.env.HASH_PEPPER;
-  // Fallback hvis pepper mangler (så crasher vi ikke, men logger en advarsel)
-  if (!pepper) {
-    console.warn("ADVARSEL: HASH_PEPPER mangler! Data gemmes uden ekstra sikkerhed.");
-    return input; 
-  }
-  
+  if (!pepper) return input; 
   return crypto.createHash('sha256').update(input + pepper).digest('hex');
 }
 
 /* ============================
-   DATABASE
+   DATABASE SETUP
 ============================ */
 const connectionString = process.env.DATABASE_URL || process.env.MANUAL_DB_URL;
-
-if (!connectionString) {
-  console.error("KRITISK FEJL: Ingen database-forbindelse fundet! Tjek variablerne.");
-}
-
 const pool = new Pool({
   connectionString: connectionString,
   ssl: { rejectUnauthorized: false }
 });
 
 /* ============================
-   LOVABLE WEBHOOK INTEGRATION
+   LOVABLE WEBHOOK
 ============================ */
 async function sendToLovable(type, payload) {
   if (!process.env.LOVABLE_WEBHOOK_URL) return;
-
   try {
     await fetch(process.env.LOVABLE_WEBHOOK_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.LOVABLE_API_KEY || 'system-update'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type, data: payload })
     });
+  } catch (err) { console.error('Lovable Error:', err.message); }
+}
+
+/* ============================
+   CORE LOGIC: THE CONFLICT GUARD 🛡️
+============================ */
+
+async function checkTimeConflict(client, secure_cust, startTime, durationMinutes) {
+  const endTime = new Date(startTime.getTime() + durationMinutes * 60000);
+
+  // Tjekker kun 'confirmed' bookinger.
+  const query = `
+    SELECT * FROM active_bookings 
+    WHERE customer_hash = $1 
+    AND status = 'confirmed'
+    AND (reservation_time < $2 AND (reservation_time + (duration_minutes || ' minutes')::interval) > $3)
+    LIMIT 1
+  `;
+  
+  const res = await client.query(query, [secure_cust, endTime, startTime]);
+  return res.rows[0];
+}
+
+/* ============================
+   HOUSEKEEPING (OPRYDNING) 🧹
+============================ */
+// Denne funktion sletter gamle bookinger automatisk
+async function cleanupOldBookings() {
+  try {
+    // Vi sletter bookinger der er ældre end 24 timer (for at holde DB slank)
+    // Vi beholder dem i 24 timer, så man kan nå at melde No-Show.
+    const res = await pool.query(
+      `DELETE FROM active_bookings WHERE reservation_time < NOW() - INTERVAL '24 hours'`
+    );
+    if (res.rowCount > 0) {
+      console.log(`🧹 Housekeeping: Slettede ${res.rowCount} gamle bookinger.`);
+    }
   } catch (err) {
-    console.error('Kunne ikke sende til Lovable:', err.message);
+    console.error('Housekeeping Error:', err.message);
   }
 }
 
-/* ============================
-   MIDDLEWARE: LOGGING
-============================ */
-app.use(async (req, res, next) => {
-  const start = Date.now();
-  res.on('finish', async () => {
-    const duration = Date.now() - start;
-    if (req.path === '/healthcheck') return;
-
-    const platformId = req.body?.platform_id || req.query?.platform_id || 'anonymous';
-
-    try {
-      pool.query(
-        `INSERT INTO api_logs 
-        (platform_id, method, endpoint, status_code, duration_ms, request_body) 
-        VALUES ($1, $2, $3, $4, $5, $6)`,
-        [platformId, req.method, req.originalUrl, res.statusCode, duration, JSON.stringify(req.body)]
-      ).catch(e => console.error('LOG ERROR:', e.message));
-    } catch (e) { console.error(e); }
-
-    sendToLovable('api_usage', {
-      platform_id: platformId,
-      endpoint: req.path,
-      request_count: 1,
-      status: res.statusCode
-    });
-  });
-  next();
-});
-
-/* ============================
-   SCORE LOGIK
-============================ */
-const SCORE_RULES = {
-  overlap:        { delta: -10, severity: 'mild',   ttlDays: 14 },
-  repeat_overlap: { delta: -20, severity: 'medium', ttlDays: 90 },
-  no_show:        { delta: -30, severity: 'high',   ttlDays: 365 }
-};
-
-// Modtager nu identity_scope (finalScope)
-async function getOrCreateScore(client, secure_customer_hash, platform_id, identity_scope) {
-  const res = await client.query(
-    `SELECT * FROM customer_scores WHERE customer_hash = $1 AND identity_scope = $2 AND (identity_scope = 'global' OR platform_id = $3)`,
-    [secure_customer_hash, identity_scope, platform_id]
-  );
-  if (res.rows.length) return res.rows[0];
-  
-  const insert = await client.query(
-    `INSERT INTO customer_scores (customer_hash, platform_id, identity_scope) VALUES ($1, $2, $3) RETURNING *`,
-    [secure_customer_hash, platform_id, identity_scope]
-  );
-  return insert.rows[0];
-}
-
-async function hasRecentOverlap(client, secure_customer_hash, platform_id, identity_scope) {
-  const res = await client.query(
-    `SELECT 1 FROM behavior_events WHERE customer_hash = $1 AND event_type IN ('overlap','repeat_overlap') AND expires_at > NOW() AND identity_scope = $2 AND (identity_scope = 'global' OR platform_id = $3) LIMIT 1`,
-    [secure_customer_hash, identity_scope, platform_id]
-  );
-  return res.rowCount > 0;
-}
-
-async function applyBehaviorEvent(client, secure_customer_hash, platform_id, identity_scope, type, secure_restaurant_hash) {
-  const rule = SCORE_RULES[type];
-  const now = new Date();
-  const expires = new Date(now);
-  expires.setDate(expires.getDate() + rule.ttlDays);
-
-  // Indsætter med det korrekte scope og restaurant hash
-  await client.query(
-    `INSERT INTO behavior_events (id, customer_hash, platform_id, identity_scope, event_type, severity, score_delta, occurred_at, expires_at, restaurant_hash) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [secure_customer_hash, platform_id, identity_scope, type, rule.severity, rule.delta, now, expires, secure_restaurant_hash]
-  );
-  
-  await client.query(
-    `UPDATE customer_scores SET score = GREATEST(0, LEAST(100, score + $1)), last_updated_at = NOW() WHERE customer_hash = $2 AND identity_scope = $3 AND (identity_scope = 'global' OR platform_id = $4)`,
-    [rule.delta, secure_customer_hash, identity_scope, platform_id]
-  );
-}
+// Start oprydning hver time (3600000 ms)
+setInterval(cleanupOldBookings, 3600000);
 
 /* ============================
    ENDPOINTS
 ============================ */
 
-app.get('/healthcheck', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.status(200).json({ status: 'healthy', database: 'connected' });
-  } catch (error) {
-    res.status(503).json({ status: 'unhealthy', error: error.message });
-  }
-});
+app.post('/booking/create', async (req, res) => {
+  const { 
+    platform_id, 
+    customer_hash, 
+    restaurant_hash, 
+    reservation_time, 
+    duration_minutes = 120, 
+    identity_scope = 'local'
+  } = req.body;
 
-app.get('/api/logs/:platform_id', async (req, res) => {
-    const { platform_id } = req.params;
-    try {
-        const result = await pool.query(`SELECT * FROM api_logs WHERE platform_id = $1 ORDER BY created_at DESC LIMIT 50`, [platform_id]);
-        res.json(result.rows);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/ping', (req, res) => res.json({ pong: true }));
-
-// --- OVERLAP EVENT ---
-app.post('/event/overlap', async (req, res) => {
-  // 1. Hent identity_scope fra request
-  const { customer_hash, platform_id, restaurant_hash, identity_scope } = req.body;
+  const secure_cust = secureHash(customer_hash);
+  const secure_rest = secureHash(restaurant_hash);
   
-  // 2. Bestem scope (default: local)
-  const finalScope = identity_scope || 'local';
-
-  // 3. Sikkerhed (Hashing)
-  const secure_cust = secureHash(customer_hash);
-  const secure_rest = secureHash(restaurant_hash);
+  const startObj = reservation_time ? new Date(reservation_time) : new Date();
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    
-    // Brug finalScope i alle kald
-    await getOrCreateScore(client, secure_cust, platform_id, finalScope);
-    const repeat = await hasRecentOverlap(client, secure_cust, platform_id, finalScope);
-    
-    const type = repeat ? 'repeat_overlap' : 'overlap';
-    
-    await applyBehaviorEvent(client, secure_cust, platform_id, finalScope, type, secure_rest);
-    
-    await client.query('COMMIT');
-    
-    sendToLovable('event', {
-      platform_id, 
-      event_type: type,
-      customer_hash, // Sender original ID til Dashboard (UI)
-      restaurant_hash,
-      scope: finalScope // Sender scope info til dashboard
-    });
 
-    res.json({ ok: true, event: type, scope: finalScope });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
-  }
-});
+    // 1. TJEK FOR KONFLIKT
+    const conflict = await checkTimeConflict(client, secure_cust, startObj, duration_minutes);
 
-// --- NO-SHOW EVENT ---
-app.post('/event/no-show', async (req, res) => {
-  const { customer_hash, platform_id, restaurant_hash, identity_scope } = req.body;
+    if (conflict) {
+      // OVERLAP DETECTED
+      await client.query(
+        `INSERT INTO behavior_events (id, customer_hash, platform_id, identity_scope, event_type, severity, score_delta, occurred_at, expires_at, restaurant_hash) 
+         VALUES (gen_random_uuid(), $1, $2, $3, 'overlap', 'mild', -10, NOW(), NOW() + interval '14 days', $4)`,
+        [secure_cust, platform_id, identity_scope, secure_rest]
+      );
+      
+      await client.query(
+        `UPDATE customer_scores SET score = GREATEST(0, LEAST(100, score - 10)), last_updated_at = NOW() 
+         WHERE customer_hash = $1`, [secure_cust]
+      );
 
-  // Bestem scope
-  const finalScope = identity_scope || 'local';
+      await client.query('COMMIT');
+      
+      return res.status(409).json({ 
+        ok: false, 
+        signal: 'OVERLAP_DETECTED', 
+        message: 'Customer has a conflicting booking.' 
+      });
+    }
 
-  // Sikkerhed
-  const secure_cust = secureHash(customer_hash);
-  const secure_rest = secureHash(restaurant_hash);
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await getOrCreateScore(client, secure_cust, platform_id, finalScope);
-    
-    await applyBehaviorEvent(client, secure_cust, platform_id, finalScope, 'no_show', secure_rest);
-    
-    await client.query('COMMIT');
-
-    sendToLovable('event', {
-      platform_id,
-      event_type: 'no_show',
-      customer_hash,
-      restaurant_hash,
-      scope: finalScope
-    });
-
-    res.json({ ok: true, scope: finalScope });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-// --- GET SCORE ---
-app.get('/score/:customer_hash', async (req, res) => {
-  const { customer_hash } = req.params;
-  // Hent scope fra URL parametre (req.query)
-  const { platform_id, identity_scope } = req.query;
-
-  const finalScope = identity_scope || 'local';
-
-  // Husk at hashe inputtet for at finde det i DB
-  const secure_cust = secureHash(customer_hash);
-
-  try {
-    const result = await pool.query(
-      `SELECT score FROM customer_scores WHERE customer_hash = $1 AND identity_scope = $2 AND (identity_scope = 'global' OR platform_id = $3)`,
-      [secure_cust, finalScope, platform_id]
+    // 2. OPRET BOOKING
+    await client.query(
+      `INSERT INTO active_bookings (customer_hash, restaurant_hash, platform_id, identity_scope, reservation_time, duration_minutes)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [secure_cust, secure_rest, platform_id, identity_scope, startObj, duration_minutes]
     );
 
-    if (!result.rows.length) return res.status(404).json({ error: 'not found' });
-    
-    const score = result.rows[0].score;
-    res.json({ score, scope: finalScope });
+    await client.query('COMMIT');
+    sendToLovable('booking', { status: 'created', time: startObj });
+    res.json({ ok: true, signal: 'BOOKING_CONFIRMED' });
+
   } catch (err) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
-/* ============================
-   START SERVER
-============================ */
+app.post('/booking/cancel', async (req, res) => {
+  const { customer_hash, reservation_time } = req.body;
+  const secure_cust = secureHash(customer_hash);
+  
+  try {
+     // Vi markerer den som cancelled i stedet for at slette den, 
+     // så Housekeeping tager den senere (eller vi kan slette den straks).
+     // Her sletter vi den med det samme for at frigive bordet i logikken.
+     await pool.query(
+       `UPDATE active_bookings SET status = 'cancelled' 
+        WHERE customer_hash = $1 AND status = 'confirmed' 
+        AND reservation_time = $2`, 
+       [secure_cust, reservation_time]
+     );
+     res.json({ ok: true, message: 'Booking cancelled' });
+  } catch (e) { res.status(500).json({error: e.message}); }
+});
+
+app.get('/healthcheck', async (req, res) => {
+    res.status(200).json({ status: 'ready_for_business' });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`ClearSlot API running on port ${PORT}`);
+  console.log(`Global Conflict Guard running on ${PORT}`);
+  // Kør en oprydning med det samme ved opstart
+  cleanupOldBookings();
 });
