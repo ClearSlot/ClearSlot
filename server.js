@@ -124,15 +124,16 @@ async function hasRecentOverlap(client, customer_hash, platform_id, identity_sco
   return res.rowCount > 0;
 }
 
-async function applyBehaviorEvent(client, customer_hash, platform_id, identity_scope, type) {
+// ÆNDRING 1: Tilføjet restaurant_hash parameter og opdateret SQL INSERT
+async function applyBehaviorEvent(client, customer_hash, platform_id, identity_scope, type, restaurant_hash) {
   const rule = SCORE_RULES[type];
   const now = new Date();
   const expires = new Date(now);
   expires.setDate(expires.getDate() + rule.ttlDays);
 
   await client.query(
-    `INSERT INTO behavior_events (id, customer_hash, platform_id, identity_scope, event_type, severity, score_delta, occurred_at, expires_at) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8)`,
-    [customer_hash, platform_id, identity_scope, type, rule.severity, rule.delta, now, expires]
+    `INSERT INTO behavior_events (id, customer_hash, platform_id, identity_scope, event_type, severity, score_delta, occurred_at, expires_at, restaurant_hash) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [customer_hash, platform_id, identity_scope, type, rule.severity, rule.delta, now, expires, restaurant_hash]
   );
   await client.query(
     `UPDATE customer_scores SET score = GREATEST(0, LEAST(100, score + $1)), last_updated_at = NOW() WHERE customer_hash = $2 AND identity_scope = $3 AND (identity_scope = 'global' OR platform_id = $4)`,
@@ -165,22 +166,26 @@ app.get('/ping', (req, res) => res.json({ pong: true }));
 
 // --- OVERLAP EVENT ---
 app.post('/event/overlap', async (req, res) => {
-  const { customer_hash, platform_id, identity_scope = 'local' } = req.body;
+  // ÆNDRING 2: Henter restaurant_hash fra body
+  const { customer_hash, platform_id, identity_scope = 'local', restaurant_hash } = req.body;
   const client = await pool.connect();
-  
+   
   try {
     await client.query('BEGIN');
     await getOrCreateScore(client, customer_hash, platform_id, identity_scope);
     const repeat = await hasRecentOverlap(client, customer_hash, platform_id, identity_scope);
     const type = repeat ? 'repeat_overlap' : 'overlap';
-    await applyBehaviorEvent(client, customer_hash, platform_id, identity_scope, type);
+    
+    // Sender restaurant_hash videre til databasen
+    await applyBehaviorEvent(client, customer_hash, platform_id, identity_scope, type, restaurant_hash);
+    
     await client.query('COMMIT');
     
-    // RETTELSE HER: Vi bruger 'platform_id' (underscore) fordi den kommer fra req.body linjen ovenover
     sendToLovable('event', {
       platform_id: platform_id, 
       event_type: type,
-      customer_hash: customer_hash
+      customer_hash: customer_hash,
+      restaurant_hash: restaurant_hash // Sender også til Lovable webhook
     });
 
     res.json({ ok: true, event: type });
@@ -194,19 +199,23 @@ app.post('/event/overlap', async (req, res) => {
 
 // --- NO-SHOW EVENT ---
 app.post('/event/no-show', async (req, res) => {
-  const { customer_hash, platform_id, identity_scope = 'local' } = req.body;
+  // ÆNDRING 3: Henter restaurant_hash fra body
+  const { customer_hash, platform_id, identity_scope = 'local', restaurant_hash } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await getOrCreateScore(client, customer_hash, platform_id, identity_scope);
-    await applyBehaviorEvent(client, customer_hash, platform_id, identity_scope, 'no_show');
+    
+    // Sender restaurant_hash videre til databasen
+    await applyBehaviorEvent(client, customer_hash, platform_id, identity_scope, 'no_show', restaurant_hash);
+    
     await client.query('COMMIT');
 
-    // RETTELSE HER: Samme her, vi bruger 'platform_id'
     sendToLovable('event', {
       platform_id: platform_id,
       event_type: 'no_show',
-      customer_hash: customer_hash
+      customer_hash: customer_hash,
+      restaurant_hash: restaurant_hash // Sender også til Lovable webhook
     });
 
     res.json({ ok: true });
@@ -226,7 +235,7 @@ app.get('/score/:customer_hash', async (req, res) => {
     [customer_hash, identity_scope, platform_id]
   );
   if (!result.rows.length) return res.status(404).json({ error: 'not found' });
-  
+   
   const score = result.rows[0].score;
   res.json({ score });
 });
