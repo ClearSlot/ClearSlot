@@ -14,12 +14,20 @@ app.use(cors());
 app.use(express.json());
 
 /* ============================
-   RATE LIMITING
+   RATE LIMITING (Structured 429)
 ============================ */
 
 const scoreLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 100
+  max: 100,
+  handler: (req, res) => {
+    res.status(429).json({
+      error: {
+        code: "RATE_LIMIT_EXCEEDED",
+        message: "Too many score requests. Please retry shortly."
+      }
+    });
+  }
 });
 
 app.use('/score', scoreLimiter);
@@ -80,8 +88,8 @@ async function recordBillableEvent(client, platform_id, restaurant_hash, type) {
   if (amount > 0) {
     await client.query(
       `INSERT INTO billing_ledger
-       (platform_id, restaurant_hash, event_type, amount_euro)
-       VALUES ($1,$2,$3,$4)`,
+       (platform_id, restaurant_hash, event_type, amount_euro, created_at)
+       VALUES ($1,$2,$3,$4,NOW())`,
       [platform_id, restaurant_hash, type, amount]
     );
   }
@@ -180,7 +188,7 @@ app.post('/booking/create', async (req, res) => {
     const secure_rest = secureHash(restaurant_hash);
     const startObj = new Date(reservation_time);
 
-    // Always bill signal layer
+    // Bill signal layer
     await recordBillableEvent(client, platform_id, secure_rest, 'signal_check');
 
     const conflict = await checkTimeConflict(client, secure_cust, startObj, duration_minutes);
@@ -379,7 +387,7 @@ app.post('/event/no-show', async (req, res) => {
 });
 
 /* ============================
-   SCORE (DYNAMIC)
+   SCORE (DYNAMIC + ISOLATED)
 ============================ */
 
 app.get('/score/:customer_hash', async (req, res) => {
@@ -416,8 +424,12 @@ app.get('/score/:customer_hash', async (req, res) => {
       WHERE customer_hash=$1
       AND identity_scope=$2
       AND expires_at > NOW()
+      AND (
+        identity_scope='global'
+        OR platform_id=$3
+      )
       `,
-      [secure_cust, identity_scope]
+      [secure_cust, identity_scope, platform_id]
     );
 
     await recordBillableEvent(client, platform_id, secure_rest, 'signal_check');
@@ -437,12 +449,12 @@ app.get('/score/:customer_hash', async (req, res) => {
 });
 
 /* ============================
-   USAGE SUMMARY
+   BILLING SUMMARY
 ============================ */
 
-app.get('/usage/summary', async (req, res) => {
+app.get('/billing/summary', async (req, res) => {
 
-  const { platform_id } = req.query;
+  const { platform_id, from, to } = req.query;
 
   if (!platform_id)
     return error(res, "INVALID_PLATFORM_ID", "platform_id required");
@@ -451,17 +463,29 @@ app.get('/usage/summary', async (req, res) => {
 
   try {
 
+    let fromDate;
+    let toDate;
+
+    if (from && to) {
+      fromDate = new Date(from);
+      toDate = new Date(to);
+    } else {
+      const now = new Date();
+      fromDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      toDate = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+    }
+
     const result = await client.query(
       `
       SELECT
-        COUNT(*) FILTER (WHERE event_type='signal_check') AS signal_requests,
+        COUNT(*) FILTER (WHERE event_type='signal_check') AS signal_checks,
         COUNT(*) FILTER (WHERE event_type='coordination_booking') AS coordination_bookings,
-        SUM(amount_euro) AS estimated_cost
+        COALESCE(SUM(amount_euro),0) AS total_revenue
       FROM billing_ledger
       WHERE platform_id=$1
-      AND created_at >= date_trunc('month', NOW())
+      AND created_at BETWEEN $2 AND $3
       `,
-      [platform_id]
+      [platform_id, fromDate, toDate]
     );
 
     res.json(result.rows[0]);
@@ -490,40 +514,3 @@ app.get('/healthcheck', (req, res) => {
 app.listen(process.env.PORT || 3000, () => {
   console.log("ClearSlot Dynamic Scoring Standard running.");
 });
-
-/* ============================
-   BILLING SUMMARY
-============================ */
-
-app.get('/billing/summary', async (req, res) => {
-  const { platform_id, from, to } = req.query;
-
-  if (!platform_id) {
-    return res.status(400).json({ error: { code: "INVALID_PLATFORM", message: "platform_id required" } });
-  }
-
-  const client = await pool.connect();
-  try {
-    const result = await client.query(
-      `
-      SELECT 
-        COUNT(*) FILTER (WHERE event_type = 'signal_check') AS signal_checks,
-        COUNT(*) FILTER (WHERE event_type = 'coordination_booking') AS coordination_bookings,
-        SUM(amount_euro) AS total_revenue
-      FROM billing_ledger
-      WHERE platform_id = $1
-      AND created_at BETWEEN COALESCE($2::timestamp, '1970-01-01')
-      AND COALESCE($3::timestamp, NOW())
-      `,
-      [platform_id, from || null, to || null]
-    );
-
-    res.json(result.rows[0]);
-
-  } catch (e) {
-    res.status(500).json({ error: { code: "SERVER_ERROR", message: e.message } });
-  } finally {
-    client.release();
-  }
-});
-
