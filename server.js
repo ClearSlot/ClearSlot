@@ -490,3 +490,40 @@ app.get('/healthcheck', (req, res) => {
 app.listen(process.env.PORT || 3000, () => {
   console.log("ClearSlot Dynamic Scoring Standard running.");
 });
+
+/* ============================
+   BILLING SUMMARY
+============================ */
+
+app.get('/billing/summary', async (req, res) => {
+  const { platform_id, from, to } = req.query;
+
+  if (!platform_id) {
+    return res.status(400).json({ error: { code: "INVALID_PLATFORM", message: "platform_id required" } });
+  }
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `
+      SELECT 
+        COUNT(*) FILTER (WHERE event_type = 'signal_check') AS signal_checks,
+        COUNT(*) FILTER (WHERE event_type = 'coordination_booking') AS coordination_bookings,
+        SUM(amount_euro) AS total_revenue
+      FROM billing_ledger
+      WHERE platform_id = $1
+      AND created_at BETWEEN COALESCE($2::timestamp, '1970-01-01')
+      AND COALESCE($3::timestamp, NOW())
+      `,
+      [platform_id, from || null, to || null]
+    );
+
+    res.json(result.rows[0]);
+
+  } catch (e) {
+    res.status(500).json({ error: { code: "SERVER_ERROR", message: e.message } });
+  } finally {
+    client.release();
+  }
+});
+
