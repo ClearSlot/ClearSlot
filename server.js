@@ -68,6 +68,7 @@ function error(res, code, message, status = 400) {
 ============================ */
 
 async function recordBillableEvent(client, platform_id, restaurant_hash, type) {
+
   const PRICES = {
     signal_check: 0.02,
     coordination_booking: 0.03,
@@ -103,8 +104,8 @@ async function checkIdempotency(client, key) {
 async function storeIdempotency(client, key, body, status) {
   await client.query(
     `INSERT INTO idempotency_keys
-     (idempotency_key, response_body, status_code)
-     VALUES ($1,$2,$3)`,
+     (idempotency_key, response_body, status_code, created_at)
+     VALUES ($1,$2,$3,NOW())`,
     [key, body, status]
   );
 }
@@ -114,6 +115,7 @@ async function storeIdempotency(client, key, body, status) {
 ============================ */
 
 async function checkTimeConflict(client, secure_cust, startTime, durationMinutes) {
+
   const endTime = new Date(startTime.getTime() + durationMinutes * 60000);
 
   const result = await client.query(
@@ -178,29 +180,24 @@ app.post('/booking/create', async (req, res) => {
     const secure_rest = secureHash(restaurant_hash);
     const startObj = new Date(reservation_time);
 
-    // Signal layer billing (always happens)
+    // Always bill signal layer
     await recordBillableEvent(client, platform_id, secure_rest, 'signal_check');
 
     const conflict = await checkTimeConflict(client, secure_cust, startObj, duration_minutes);
 
     if (conflict) {
 
-      // Standard scoring delta (-10)
       await client.query(
         `INSERT INTO behavior_events
-         (id, customer_hash, platform_id, identity_scope, event_type, severity,
-          score_delta, occurred_at, expires_at, restaurant_hash)
-         VALUES (gen_random_uuid(), $1,$2,$3,'overlap','mild',
-                 -10, NOW(), NOW() + interval '14 days', $4)`,
+         (id, customer_hash, platform_id, identity_scope,
+          event_type, severity, score_delta,
+          occurred_at, expires_at, restaurant_hash)
+         VALUES (gen_random_uuid(), $1,$2,$3,
+                 'overlap','mild',
+                 -10, NOW(),
+                 NOW() + interval '14 days',
+                 $4)`,
         [secure_cust, platform_id, identity_scope, secure_rest]
-      );
-
-      await client.query(
-        `UPDATE customer_scores
-         SET score = GREATEST(0, LEAST(100, score - 10)),
-             last_updated_at = NOW()
-         WHERE customer_hash=$1 AND identity_scope=$2`,
-        [secure_cust, identity_scope]
       );
 
       const response = {
@@ -216,13 +213,14 @@ app.post('/booking/create', async (req, res) => {
 
     await client.query(
       `INSERT INTO active_bookings
-       (customer_hash, restaurant_hash, platform_id, identity_scope,
-        reservation_time, duration_minutes, status)
+       (customer_hash, restaurant_hash, platform_id,
+        identity_scope, reservation_time,
+        duration_minutes, status)
        VALUES ($1,$2,$3,$4,$5,$6,'confirmed')`,
-      [secure_cust, secure_rest, platform_id, identity_scope, startObj, duration_minutes]
+      [secure_cust, secure_rest, platform_id,
+       identity_scope, startObj, duration_minutes]
     );
 
-    // Coordination billing
     await recordBillableEvent(client, platform_id, secure_rest, 'coordination_booking');
 
     const response = {
@@ -238,7 +236,9 @@ app.post('/booking/create', async (req, res) => {
 
   } catch (e) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: { code: "SERVER_ERROR", message: e.message } });
+    res.status(500).json({
+      error: { code: "SERVER_ERROR", message: e.message }
+    });
   } finally {
     client.release();
   }
@@ -287,29 +287,19 @@ app.post('/booking/cancel', async (req, res) => {
       return error(res, "NOT_FOUND", "Booking not found", 404);
     }
 
-    let signal = "BOOKING_CANCELLED";
-
     if (hoursUntil < 2 && hoursUntil > -1) {
 
-      signal = "LATE_CANCEL_SIGNAL";
-
-      // Standard scoring delta (-15)
       await client.query(
         `INSERT INTO behavior_events
-         (id, customer_hash, platform_id, identity_scope, event_type,
-          severity, score_delta, occurred_at, expires_at, restaurant_hash)
-         VALUES (gen_random_uuid(), $1,$2,$3,'late_cancel',
-                 'medium', -15, NOW(),
-                 NOW() + interval '30 days', $4)`,
+         (id, customer_hash, platform_id, identity_scope,
+          event_type, severity, score_delta,
+          occurred_at, expires_at, restaurant_hash)
+         VALUES (gen_random_uuid(), $1,$2,$3,
+                 'late_cancel','medium',
+                 -15, NOW(),
+                 NOW() + interval '30 days',
+                 $4)`,
         [secure_cust, platform_id, identity_scope, secure_rest]
-      );
-
-      await client.query(
-        `UPDATE customer_scores
-         SET score = GREATEST(0, LEAST(100, score - 15)),
-             last_updated_at = NOW()
-         WHERE customer_hash=$1 AND identity_scope=$2`,
-        [secure_cust, identity_scope]
       );
     }
 
@@ -317,20 +307,22 @@ app.post('/booking/cancel', async (req, res) => {
 
     res.json({
       ok: true,
-      signal,
+      signal: "BOOKING_CANCELLED",
       message: "Coordination signal returned."
     });
 
   } catch (e) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: { code: "SERVER_ERROR", message: e.message } });
+    res.status(500).json({
+      error: { code: "SERVER_ERROR", message: e.message }
+    });
   } finally {
     client.release();
   }
 });
 
 /* ============================
-   REPORT NO SHOW
+   REPORT NO-SHOW
 ============================ */
 
 app.post('/event/no-show', async (req, res) => {
@@ -353,24 +345,17 @@ app.post('/event/no-show', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Standard scoring delta (-30)
     await client.query(
       `INSERT INTO behavior_events
        (id, customer_hash, platform_id, identity_scope,
         event_type, severity, score_delta,
         occurred_at, expires_at, restaurant_hash)
-       VALUES (gen_random_uuid(), $1,$2,$3,'no_show',
-               'high', -30, NOW(),
-               NOW() + interval '365 days', $4)`,
+       VALUES (gen_random_uuid(), $1,$2,$3,
+               'no_show','high',
+               -30, NOW(),
+               NOW() + interval '365 days',
+               $4)`,
       [secure_cust, platform_id, identity_scope, secure_rest]
-    );
-
-    await client.query(
-      `UPDATE customer_scores
-       SET score = GREATEST(0, LEAST(100, score - 30)),
-           last_updated_at = NOW()
-       WHERE customer_hash=$1 AND identity_scope=$2`,
-      [secure_cust, identity_scope]
     );
 
     await recordBillableEvent(client, platform_id, secure_rest, 'data_report');
@@ -385,14 +370,16 @@ app.post('/event/no-show', async (req, res) => {
 
   } catch (e) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: { code: "SERVER_ERROR", message: e.message } });
+    res.status(500).json({
+      error: { code: "SERVER_ERROR", message: e.message }
+    });
   } finally {
     client.release();
   }
 });
 
 /* ============================
-   SCORE CHECK
+   SCORE (DYNAMIC)
 ============================ */
 
 app.get('/score/:customer_hash', async (req, res) => {
@@ -416,50 +403,77 @@ app.get('/score/:customer_hash', async (req, res) => {
   try {
 
     const result = await client.query(
-      `SELECT score
-       FROM customer_scores
-       WHERE customer_hash=$1
-       AND identity_scope=$2`,
+      `
+      SELECT
+        GREATEST(
+          0,
+          LEAST(
+            100,
+            100 + COALESCE(SUM(score_delta),0)
+          )
+        ) AS score
+      FROM behavior_events
+      WHERE customer_hash=$1
+      AND identity_scope=$2
+      AND expires_at > NOW()
+      `,
       [secure_cust, identity_scope]
     );
 
     await recordBillableEvent(client, platform_id, secure_rest, 'signal_check');
 
-    if (!result.rows.length) {
-      return res.status(404).json({ score: 100, scope: identity_scope });
-    }
-
     res.json({
-      score: result.rows[0].score,
+      score: result.rows[0].score || 100,
       scope: identity_scope
     });
 
   } catch (e) {
-    res.status(500).json({ error: { code: "SERVER_ERROR", message: e.message } });
+    res.status(500).json({
+      error: { code: "SERVER_ERROR", message: e.message }
+    });
   } finally {
     client.release();
   }
 });
 
 /* ============================
-   HOUSEKEEPING
+   USAGE SUMMARY
 ============================ */
 
-async function cleanupOldBookings() {
-  await pool.query(
-    `INSERT INTO booking_archive
-     SELECT *, NOW()
-     FROM active_bookings
-     WHERE reservation_time < NOW() - INTERVAL '24 hours'`
-  );
+app.get('/usage/summary', async (req, res) => {
 
-  await pool.query(
-    `DELETE FROM active_bookings
-     WHERE reservation_time < NOW() - INTERVAL '24 hours'`
-  );
-}
+  const { platform_id } = req.query;
 
-setInterval(cleanupOldBookings, 3600000);
+  if (!platform_id)
+    return error(res, "INVALID_PLATFORM_ID", "platform_id required");
+
+  const client = await pool.connect();
+
+  try {
+
+    const result = await client.query(
+      `
+      SELECT
+        COUNT(*) FILTER (WHERE event_type='signal_check') AS signal_requests,
+        COUNT(*) FILTER (WHERE event_type='coordination_booking') AS coordination_bookings,
+        SUM(amount_euro) AS estimated_cost
+      FROM billing_ledger
+      WHERE platform_id=$1
+      AND created_at >= date_trunc('month', NOW())
+      `,
+      [platform_id]
+    );
+
+    res.json(result.rows[0]);
+
+  } catch (e) {
+    res.status(500).json({
+      error: { code: "SERVER_ERROR", message: e.message }
+    });
+  } finally {
+    client.release();
+  }
+});
 
 /* ============================
    HEALTH
@@ -474,5 +488,5 @@ app.get('/healthcheck', (req, res) => {
 ============================ */
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log("ClearSlot Scoring Standard running.");
+  console.log("ClearSlot Dynamic Scoring Standard running.");
 });
