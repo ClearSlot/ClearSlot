@@ -42,14 +42,13 @@ async function sendToLovable(type, payload) {
 }
 
 /* ============================
-   BILLING LOGIC (NY PRISMODEL: €0.05 TOTAL) 💰
+   BILLING LOGIC (€0.05 TOTAL)
 ============================ */
 async function recordBillableEvent(client, platform_id, restaurant_hash, type) {
-  // PRISLISTE (I EURO)
   const PRICES = {
-    'coordination_booking': 0.03,  // €0.03 (Selve bookingen / Garantien)
-    'signal_check':         0.02,  // €0.02 (Data opslag / Score check)
-    'data_report':          0.00   // Gratis (Vi vil have No-Show data ind!)
+    'coordination_booking': 0.03,
+    'signal_check': 0.02,
+    'data_report': 0.00
   };
 
   const amount = PRICES[type] || 0;
@@ -64,13 +63,11 @@ async function recordBillableEvent(client, platform_id, restaurant_hash, type) {
 }
 
 /* ============================
-   CORE LOGIC: CONFLICT GUARD 🛡️
+   CORE LOGIC: CONFLICT GUARD
 ============================ */
 async function checkTimeConflict(client, secure_cust, startTime, durationMinutes) {
   const endTime = new Date(startTime.getTime() + durationMinutes * 60000);
   
-  // Tjekker kun 'confirmed' bookinger.
-  // SQL Logik: (StartA < SlutB) OG (SlutA > StartB)
   const query = `
     SELECT * FROM active_bookings 
     WHERE customer_hash = $1 
@@ -83,24 +80,23 @@ async function checkTimeConflict(client, secure_cust, startTime, durationMinutes
 }
 
 /* ============================
-   HOUSEKEEPING (OPRYDNING) 🧹
+   HOUSEKEEPING
 ============================ */
 async function cleanupOldBookings() {
   try {
-    // Slet bookinger ældre end 24 timer
     const res = await pool.query(
       `DELETE FROM active_bookings WHERE reservation_time < NOW() - INTERVAL '24 hours'`
     );
-    if (res.rowCount > 0) console.log(`🧹 Housekeeping: Slettede ${res.rowCount} gamle bookinger.`);
+    if (res.rowCount > 0) console.log(`Housekeeping: Removed ${res.rowCount} expired bookings.`);
   } catch (err) { console.error('Housekeeping Error:', err.message); }
 }
-setInterval(cleanupOldBookings, 3600000); // Kør hver time
+setInterval(cleanupOldBookings, 3600000);
 
 /* ============================
    ENDPOINTS
 ============================ */
 
-// --- COORDINATION LAYER: CREATE BOOKING (€0.03) ---
+// --- COORDINATION LAYER: CREATE BOOKING ---
 app.post('/booking/create', async (req, res) => {
   const { 
     platform_id, customer_hash, restaurant_hash, reservation_time, 
@@ -115,11 +111,10 @@ app.post('/booking/create', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Tjek Konflikt
     const conflict = await checkTimeConflict(client, secure_cust, startObj, duration_minutes);
 
     if (conflict) {
-      // OVERLAP DETECTED -> Straf (-10) -> Ingen Fakturering (Booking fejlede)
+      // Standard scoring delta (-10)
       await client.query(
         `INSERT INTO behavior_events (id, customer_hash, platform_id, identity_scope, event_type, severity, score_delta, occurred_at, expires_at, restaurant_hash) 
          VALUES (gen_random_uuid(), $1, $2, $3, 'overlap', 'mild', -10, NOW(), NOW() + interval '14 days', $4)`,
@@ -131,25 +126,35 @@ app.post('/booking/create', async (req, res) => {
       );
       await client.query('COMMIT');
       
-      // Vi sender også data til Lovable for UI feedback
-      sendToLovable('event', { platform_id, event_type: 'OVERLAP_DETECTED', customer_hash });
+      sendToLovable('coordination_signal', { 
+        platform_id, 
+        signal: 'OVERLAP_DETECTED', 
+        customer_hash 
+      });
       
-      return res.status(409).json({ ok: false, signal: 'OVERLAP_DETECTED', message: 'Conflict blocked.' });
+      return res.status(409).json({ 
+        ok: false, 
+        signal: 'OVERLAP_DETECTED', 
+        message: 'Coordination signal returned. Additional confirmation recommended.' 
+      });
     }
 
-    // 2. Opret Booking (Ingen konflikt)
     await client.query(
       `INSERT INTO active_bookings (customer_hash, restaurant_hash, platform_id, identity_scope, reservation_time, duration_minutes)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [secure_cust, secure_rest, platform_id, identity_scope, startObj, duration_minutes]
     );
 
-    // 3. FAKTURERING (€0.03) 💰
     await recordBillableEvent(client, platform_id, secure_rest, 'coordination_booking');
 
     await client.query('COMMIT');
-    sendToLovable('booking', { status: 'created', time: startObj });
-    res.json({ ok: true, signal: 'BOOKING_CONFIRMED' });
+    sendToLovable('booking_event', { status: 'created', time: startObj });
+
+    res.json({ 
+      ok: true, 
+      signal: 'BOOKING_CONFIRMED',
+      message: 'Coordination signal returned.'
+    });
 
   } catch (err) {
     await client.query('ROLLBACK');
@@ -159,7 +164,7 @@ app.post('/booking/create', async (req, res) => {
   }
 });
 
-// --- CANCEL BOOKING (Gratis & Late Cancel Logic) ---
+// --- CANCEL BOOKING ---
 app.post('/booking/cancel', async (req, res) => {
   const { platform_id, customer_hash, restaurant_hash, reservation_time, identity_scope = 'local' } = req.body;
   const secure_cust = secureHash(customer_hash);
@@ -184,9 +189,10 @@ app.post('/booking/cancel', async (req, res) => {
      }
 
      let signal = 'BOOKING_CANCELLED';
-     // Late Cancel (< 2 timer) -> Straf (-15)
+
      if (hoursUntilBooking < 2 && hoursUntilBooking > -1) {
         signal = 'LATE_CANCEL_PENALTY';
+        // Standard scoring delta (-15)
         await client.query(
           `INSERT INTO behavior_events (id, customer_hash, platform_id, identity_scope, event_type, severity, score_delta, occurred_at, expires_at, restaurant_hash) 
            VALUES (gen_random_uuid(), $1, $2, $3, 'late_cancel', 'medium', -15, NOW(), NOW() + interval '30 days', $4)`,
@@ -199,7 +205,11 @@ app.post('/booking/cancel', async (req, res) => {
      }
 
      await client.query('COMMIT');
-     res.json({ ok: true, signal: signal });
+     res.json({ 
+       ok: true, 
+       signal: signal,
+       message: 'Coordination signal returned.'
+     });
 
   } catch (e) { 
     await client.query('ROLLBACK');
@@ -209,7 +219,7 @@ app.post('/booking/cancel', async (req, res) => {
   }
 });
 
-// --- REPORT NO-SHOW (Gratis - Data Incentive) ---
+// --- REPORT NO-SHOW ---
 app.post('/event/no-show', async (req, res) => {
   const { customer_hash, platform_id, restaurant_hash, identity_scope = 'local' } = req.body;
   const secure_cust = secureHash(customer_hash);
@@ -219,25 +229,32 @@ app.post('/event/no-show', async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // Opret Event (-30)
+    // Standard scoring delta (-30)
     await client.query(
       `INSERT INTO behavior_events (id, customer_hash, platform_id, identity_scope, event_type, severity, score_delta, occurred_at, expires_at, restaurant_hash) 
        VALUES (gen_random_uuid(), $1, $2, $3, 'no_show', 'high', -30, NOW(), NOW() + interval '365 days', $4)`,
       [secure_cust, platform_id, identity_scope, secure_rest]
     );
 
-    // Opdater Score
     await client.query(
       `UPDATE customer_scores SET score = GREATEST(0, LEAST(100, score - 30)), last_updated_at = NOW() 
        WHERE customer_hash = $1`, [secure_cust]
     );
 
-    // Logget til fakturering (men gratis)
     await recordBillableEvent(client, platform_id, secure_rest, 'data_report');
 
     await client.query('COMMIT');
-    sendToLovable('event', { platform_id, event_type: 'no_show', customer_hash });
-    res.json({ ok: true, signal: 'NO_SHOW_RECORDED' });
+    sendToLovable('score_adjustment_event', { 
+      platform_id, 
+      signal: 'NO_SHOW_RECORDED', 
+      customer_hash 
+    });
+
+    res.json({ 
+      ok: true, 
+      signal: 'NO_SHOW_RECORDED',
+      message: 'Score adjustment event recorded.'
+    });
 
   } catch (err) {
     await client.query('ROLLBACK');
@@ -247,7 +264,7 @@ app.post('/event/no-show', async (req, res) => {
   }
 });
 
-// --- SIGNAL LAYER: GET SCORE (€0.02) ---
+// --- SIGNAL LAYER: GET SCORE ---
 app.get('/score/:customer_hash', async (req, res) => {
   const { customer_hash } = req.params;
   const { platform_id, identity_scope = 'local', restaurant_hash } = req.query;
@@ -261,19 +278,29 @@ app.get('/score/:customer_hash', async (req, res) => {
       [secure_cust, identity_scope, platform_id]
     );
     
-    // FAKTURERING: Signal Layer (€0.02) 💰
     await recordBillableEvent(client, platform_id || 'anonymous', secure_rest, 'signal_check');
     
     if (!result.rows.length) return res.status(404).json({ error: 'not found' });
-    res.json({ score: result.rows[0].score, scope: identity_scope });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-  finally { client.release(); }
+
+    res.json({ 
+      score: result.rows[0].score, 
+      scope: identity_scope 
+    });
+
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+  finally { 
+    client.release(); 
+  }
 });
 
-app.get('/healthcheck', async (req, res) => { res.status(200).json({ status: 'ready' }); });
+app.get('/healthcheck', async (req, res) => { 
+  res.status(200).json({ status: 'ready' }); 
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Global Conflict Guard (Euro Pricing) running on ${PORT}`);
-  cleanupOldBookings(); // Kør oprydning ved start
+  console.log(`ClearSlot Scoring Standard running on ${PORT}`);
+  cleanupOldBookings();
 });
